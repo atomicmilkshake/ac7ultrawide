@@ -18,7 +18,7 @@ Patches 1 and 2 work by scanning the game's in-memory image and writing a small 
 
 - ACE COMBAT 7: SKIES UNKNOWN (Steam, original/unpatched `Ace7Game.exe`)
 - [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader) — place `version.dll` in the game root
-- For the HUD patch: [hudtextfix](https://www.nexusmods.com/acecombat7skiesunknown/mods/408) installed under `Mods/hudtextfix.ini`
+- For the HUD patch: [hudtextfix (Nexus Mods)](https://www.nexusmods.com/acecombat7skiesunknown/mods/408) installed under `Mods/hudtextfix.ini`
 
 ## Installation
 
