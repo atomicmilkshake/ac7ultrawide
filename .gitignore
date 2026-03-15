@@ -1,0 +1,30 @@
+# Conversation logs
+*.txt
+!CMakeLists.txt
+
+# Rust build output
+ac7ultrawide-rs/target/
+
+# CMake build directories
+build/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+*.cmake
+Makefile
+
+# Compiled output
+*.dll
+*.asi
+*.lib
+*.exp
+*.pdb
+
+# Logs
+*.log
+
+# IDE
+.vs/
+.vscode/
+*.user

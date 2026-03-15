@@ -1,0 +1,18 @@
+[package]
+name    = "ac7ultrawide"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name       = "ac7ultrawide"
+crate-type = ["cdylib"]
+
+# No external dependencies.
+# All Windows API calls are declared with raw extern "system" blocks below.
+
+[profile.release]
+opt-level     = "z"   # minimise binary size
+lto           = true
+codegen-units = 1
+panic         = "abort"
+strip         = true
