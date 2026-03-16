@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ac7ultrawide LANGUAGES CXX)
+project(ac7ultrawide LANGUAGES C CXX)
 
 # ---------------------------------------------------------------------------
 # ac7ultrawide.asi
@@ -17,6 +17,21 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
         "or:   cmake -B build -G \"Visual Studio 17 2022\" -A x64")
 endif()
 
+# ---------------------------------------------------------------------------
+# MinHook — lightweight x86/x64 inline hooking library (MIT)
+# Used to detour ID3D11Device::CreatePixelShader for HUD shader replacement.
+# ---------------------------------------------------------------------------
+add_library(minhook STATIC
+    external/minhook/src/buffer.c
+    external/minhook/src/hook.c
+    external/minhook/src/trampoline.c
+    external/minhook/src/hde/hde64.c)
+target_include_directories(minhook PUBLIC external/minhook/include)
+if(MSVC)
+    set_property(TARGET minhook PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 add_library(ac7ultrawide SHARED src/dllmain.cpp)
 
 # Output as .asi, no 'lib' prefix
@@ -29,6 +44,8 @@ target_compile_definitions(ac7ultrawide PRIVATE
     WIN32_LEAN_AND_MEAN
     NOMINMAX
     _CRT_SECURE_NO_WARNINGS)
+
+target_link_libraries(ac7ultrawide PRIVATE minhook)
 
 if(MSVC)
     # Optimised release build, treat warnings as info only

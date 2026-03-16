@@ -1,0 +1,3 @@
+[submodule "ac7ultrawide-asi/external/minhook"]
+	path = ac7ultrawide-asi/external/minhook
+	url = https://github.com/TsudaKageyu/minhook.git

@@ -6,6 +6,7 @@
 //   - Removes letterbox black bars
 //   - Sets horizontal FOV to match your ultrawide aspect ratio
 //   - Updates Mods/hudtextfix.ini with the correct HUD shift value
+//   - Hooks D3D11 CreatePixelShader to fix HUD positioning directly
 //
 // Requires: the ORIGINAL (unpatched) Ace7Game.exe.
 // If magic.py was previously run, restore Ace7Game.exe from the .bak or
@@ -21,10 +22,12 @@
 #include <d3d11.h>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <fstream>
 #include <sstream>
 #include <iomanip>
+#include <MinHook.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -152,200 +155,256 @@ static bool UpdateHudShift(const std::string& iniPath, double shift)
 }
 
 // ============================================================================
-// D3D11 shader hook — HUD text vertex shader
+// D3D11 shader hook — HUD position correction via MinHook + D3DCompile
 //
-// The HUD-text vertex shader (3Dmigoto FNV-1 hash da86a094e768f000) positions
-// text elements assuming 16:9.  On ultrawide the text drifts off-centre.
-// We IAT-hook D3D11CreateDevice* at DllMain time, then vtable-hook
-// ID3D11Device::CreateVertexShader (slot 12).  When the target shader is
-// submitted we compile and return a replacement with the correct clip-space
-// x-shift so subtitles, radio text, and map labels stay centred.
+// AC7's HUD pixel shaders multiply cb1[127].y (aspect ratio) by the literal
+// float 16/9 (1.777778).  For ultrawide, this produces wrong HUD positions.
 //
-// Shift formula:  clip_shift = 1 - (16/9) / aspect
-// Derivation: 3Dmigoto used 0.2558 for 3440×1440 (aspect 2.3889),
-//             this formula gives 0.2559 — matching to 4 significant figures.
+// We hook CreatePixelShader via MinHook, detect shaders containing the 16/9
+// literal, and substitute a D3DCompile'd replacement with the correct HUD
+// shift baked in.  D3DCompile produces valid DXBC with correct checksums,
+// avoiding the custom-hash nightmare of in-place bytecode patching.
 // ============================================================================
 
-// Clip-space x-shift for HUD text.  0 on 16:9 (no-op).
-// Computed in DllMain before PatchIAT is called.
-static double g_clip_shift = 0.0;
+// HUD shift in clip-space.  Computed at startup from screen resolution.
+// If 0.0, no patching is performed (16:9 or narrower monitor).
+static float g_hudShift = 0.0f;
 
-// FNV-1 64-bit — 3Dmigoto's default shader hash algorithm.
-static uint64_t Fnv1Hash64(const void* data, size_t n)
-{
-    uint64_t h = 14695981039346656037ULL;
-    for (const auto* p = static_cast<const uint8_t*>(data); n--; ++p)
-        { h *= 1099511628211ULL; h ^= *p; }
-    return h;
-}
-static constexpr uint64_t kHudTextVsHash = 0xda86a094e768f000ULL;
+// Compiled replacement shader blob (cached from D3DCompile at startup).
+static ID3DBlob* g_compiledHudPS = nullptr;
 
-// Replacement HLSL.  %.6f is substituted with g_clip_shift.
-// Logic is identical to the original shader; IniParams (3Dmigoto-only) is
-// removed and the shift is applied unconditionally.
-static const char kHudVsTemplate[] =
-    "cbuffer cb0:register(b0){float4 cb0[4];}\n"
-    "void main(\n"
-    "  float4 v0:ATTRIBUTE0,float2 v1:ATTRIBUTE1,float2 v2:ATTRIBUTE2,\n"
-    "  float4 v3:ATTRIBUTE3,uint2 v4:ATTRIBUTE4,\n"
-    "  out float4 o0:SV_POSITION0,out float4 o1:COLOR0,\n"
-    "  out float4 o2:ORIGINAL_POSITION0,\n"
-    "  out float4 o3:TEXCOORD0,out float4 o4:TEXCOORD1)\n"
-    "{\n"
-    "  float4 r0=cb0[1]*v2.y; r0=v2.x*cb0[0]+r0; o0=cb0[3]+r0;\n"
-    "  float3 c=max((float3)6.10352e-5,v3.xyz);\n"
-    "  float3 lo=c*0.0773993805;\n"
-    "  float3 hi=exp2(log2(c*0.947867274+0.0521326996)*2.4000001);\n"
-    "  o1.xyz=c>(float3)0.0404499993?hi:lo; o1.w=v3.w;\n"
-    "  o2.xy=v2.xy; o2.zw=float2(0,1); o3.xy=v1.xy; o4=v0;\n"
-    "  o0.x+=%.6f;\n"   // ultrawide clip-space shift
+// D3DCompile function pointer (loaded from d3dcompiler_47.dll at startup).
+typedef HRESULT (WINAPI *PFN_D3DCompile)(
+    LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*,
+    ID3DInclude*, LPCSTR, LPCSTR, UINT, UINT,
+    ID3DBlob**, ID3DBlob**);
+static PFN_D3DCompile g_pD3DCompile = nullptr;
+
+// Shader hook function pointers.
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CPS)(
+    ID3D11Device*, const void*, SIZE_T, ID3D11ClassLinkage*, ID3D11PixelShader**);
+static PFN_CPS g_origCPS = nullptr;
+
+// ---------------------------------------------------------------------------
+// HLSL template for the primary HUD pixel shader (PS[436], len=1104).
+// Based on 3Dmigoto's proven 9958a636cbef5557-ps_replace.txt.
+// The %.6f placeholder is replaced with g_hudShift at compile time.
+// ---------------------------------------------------------------------------
+static const char kHudPS_HLSL_Fmt[] =
+    "cbuffer cb1 : register(b1) { float4 cb1[129]; }\n"
+    "cbuffer cb0 : register(b0) { float4 cb0[21]; }\n"
+    "Texture2D<float4> t1 : register(t1);\n"
+    "Texture2D<float4> t0 : register(t0);\n"
+    "SamplerState s0_s : register(s0);\n"
+    "#define cmp -\n"
+    "void main(float2 v0 : TEXCOORD0, out float4 o0 : SV_Target0) {\n"
+    "  float4 r0,r1,r2,r3;\n"
+    "  r0.x = cmp(1 < cb1[127].y);\n"
+    "  r0.y = 1.77777779 * cb1[127].y;\n"
+    "  r0.y += %.6f;\n"
+    "  r0.y = cb1[127].x / r0.y;\n"
+    "  r0.zw = v0.xy * cb1[128].xy + -cb1[126].xy;\n"
+    "  r1.yz = cb1[127].zw * r0.zw;\n"
+    "  r0.y = r1.y * r0.y;\n"
+    "  r1.x = r0.x ? r0.y : r1.y;\n"
+    "  r0.xy = cmp(r1.xz >= cb0[20].xy);\n"
+    "  r0.zw = cmp(cb0[20].zw >= r1.xz);\n"
+    "  r0.x = r0.z ? r0.x : 0;\n"
+    "  r0.x = r0.y ? r0.x : 0;\n"
+    "  r0.yz = cmp(r1.xz >= cb0[19].xy);\n"
+    "  r1.yw = cmp(cb0[19].zw >= r1.xz);\n"
+    "  r2.xyzw = t1.Sample(s0_s, v0.xy).xyzw;\n"
+    "  r0.y = r0.y ? r1.y : 0;\n"
+    "  r0.xy = r0.wz ? r0.xy : 0;\n"
+    "  r0.y = r1.w ? r0.y : 0;\n"
+    "  r0.x = (int)r0.y | (int)r0.x;\n"
+    "  r0.y = 1 + -r2.w;\n"
+    "  r1.xyzw = t0.Sample(s0_s, v0.xy).xyzw;\n"
+    "  r3.xyzw = r1.xyzw * r2.wwww;\n"
+    "  r3.xyzw = r0.yyyy * r3.xyzw + r2.xyzw;\n"
+    "  r0.y = 1 + -r1.w;\n"
+    "  r1.xyzw = r0.yyyy * r2.xyzw + r1.xyzw;\n"
+    "  o0.xyzw = r0.xxxx ? r3.xyzw : r1.xyzw;\n"
     "}\n";
 
-// D3DCompile loaded lazily from the system d3dcompiler DLL.
-typedef HRESULT (WINAPI *PFN_D3DCompile)(
-    LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*,
-    LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
-static PFN_D3DCompile g_D3DCompile = nullptr;
-
-static bool LoadD3DCompiler()
+// Check if DXBC bytecode contains the 16/9 float literal (DWORD-aligned scan).
+static bool ContainsAspectFloat(const void* bytecode, SIZE_T len)
 {
-    if (g_D3DCompile) return true;
-    static const char* const kDlls[] =
-        { "d3dcompiler_47.dll", "d3dcompiler_46.dll", "d3dcompiler_43.dll" };
-    for (auto* name : kDlls) {
-        HMODULE h = LoadLibraryA(name);
-        if (!h) continue;
-        g_D3DCompile = reinterpret_cast<PFN_D3DCompile>(GetProcAddress(h, "D3DCompile"));
-        if (g_D3DCompile) return true;
+    const float kTarget = 16.0f / 9.0f;
+    const auto* bytes = static_cast<const uint8_t*>(bytecode);
+    for (SIZE_T i = 0; i + 4 <= len; i += 4) {
+        float val;
+        memcpy(&val, bytes + i, 4);
+        if (fabsf(val - kTarget) < 0.0001f)
+            return true;
     }
     return false;
 }
 
-static bool CompileHudVs(ID3DBlob** ppOut)
+// Compile HUD replacement PS from HLSL template with shift value baked in.
+static bool CompileHudShader()
 {
-    if (!LoadD3DCompiler()) { Log("HUD VS: D3DCompiler not found"); return false; }
-    char src[2048];
-    snprintf(src, sizeof(src), kHudVsTemplate, g_clip_shift);
-    ID3DBlob* err = nullptr;
-    HRESULT hr = g_D3DCompile(src, strlen(src), "ac7ultrawide_hudvs",
-                               nullptr, nullptr, "main", "vs_5_0", 0, 0, ppOut, &err);
-    if (err) {
-        Logf("HUD VS compile error: %s",
-             static_cast<const char*>(err->GetBufferPointer()));
-        err->Release();
+    if (!g_pD3DCompile || g_hudShift == 0.0f) return false;
+
+    char hlsl[2048];
+    snprintf(hlsl, sizeof(hlsl), kHudPS_HLSL_Fmt, g_hudShift);
+
+    ID3DBlob* errors = nullptr;
+    HRESULT hr = g_pD3DCompile(
+        hlsl, strlen(hlsl),
+        "HudPS", nullptr, nullptr,
+        "main", "ps_5_0",
+        0, 0,
+        &g_compiledHudPS, &errors);
+
+    if (FAILED(hr)) {
+        if (errors) {
+            Logf("D3DCompile HUD PS failed: %s",
+                 (const char*)errors->GetBufferPointer());
+            errors->Release();
+        } else {
+            Logf("D3DCompile HUD PS failed: hr=0x%08X", (unsigned)hr);
+        }
+        return false;
     }
-    return SUCCEEDED(hr);
+    if (errors) errors->Release();
+
+    Logf("D3DCompile HUD PS: OK (%zu bytes, shift=%.6f)",
+         g_compiledHudPS->GetBufferSize(), g_hudShift);
+    return true;
 }
 
-// ID3D11Device vtable slot 12 = CreateVertexShader.
-typedef HRESULT (STDMETHODCALLTYPE *PFN_CVS)(
-    ID3D11Device*, const void*, SIZE_T, ID3D11ClassLinkage*, ID3D11VertexShader**);
-static PFN_CVS g_origCVS = nullptr;
-
-static HRESULT STDMETHODCALLTYPE HookCreateVertexShader(
+static HRESULT STDMETHODCALLTYPE HookCreatePixelShader(
     ID3D11Device*       device,
     const void*         pBytecode,
     SIZE_T              len,
     ID3D11ClassLinkage* pCL,
-    ID3D11VertexShader** ppVS)
+    ID3D11PixelShader** ppPS)
 {
-    if (g_clip_shift != 0.0 && Fnv1Hash64(pBytecode, len) == kHudTextVsHash) {
-        ID3DBlob* blob = nullptr;
-        if (CompileHudVs(&blob)) {
-            HRESULT hr = g_origCVS(device,
-                blob->GetBufferPointer(), blob->GetBufferSize(), pCL, ppVS);
-            blob->Release();
-            if (SUCCEEDED(hr)) { Log("HUD text VS: patched OK"); return hr; }
-            Log("HUD text VS: device rejected replacement, using original");
+    // Detect shaders containing the 16/9 aspect literal and substitute.
+    if (g_compiledHudPS && ContainsAspectFloat(pBytecode, len)) {
+        // PS[436] (len=1104): primary HUD shader — use compiled replacement.
+        if (len == 1104) {
+            HRESULT hr = g_origCPS(device,
+                                    g_compiledHudPS->GetBufferPointer(),
+                                    g_compiledHudPS->GetBufferSize(),
+                                    pCL, ppPS);
+            if (SUCCEEDED(hr)) {
+                Logf("PS HUD patch: OK (original len=%zu, replacement len=%zu)",
+                     len, g_compiledHudPS->GetBufferSize());
+                g_log.flush();
+                return hr;
+            }
+            Logf("PS HUD patch: CreatePixelShader failed (hr=0x%08X)",
+                 (unsigned)hr);
+            g_log.flush();
+        } else {
+            Logf("PS HUD candidate: len=%zu contains 16/9 float (no replacement yet)",
+                 len);
+            g_log.flush();
         }
     }
-    return g_origCVS(device, pBytecode, len, pCL, ppVS);
+
+    return g_origCPS(device, pBytecode, len, pCL, ppPS);
 }
 
-static bool g_deviceHooked = false;
-static void HookDevice(ID3D11Device* dev)
-{
-    if (g_deviceHooked) return;
-    g_deviceHooked = true;
-    void** vt = *reinterpret_cast<void***>(dev);
-    DWORD old;
-    VirtualProtect(vt + 12, sizeof(void*), PAGE_EXECUTE_READWRITE, &old);
-    g_origCVS = reinterpret_cast<PFN_CVS>(vt[12]);
-    vt[12]    = reinterpret_cast<void*>(HookCreateVertexShader);
-    VirtualProtect(vt + 12, sizeof(void*), old, &old);
-    Log("D3D11 device vtable hooked (slot 12 = CreateVertexShader)");
-}
-
-// IAT hook — D3D11CreateDevice.
-typedef HRESULT (WINAPI *PFN_CreateDevice)(
+// D3D11CreateDevice hooks — intercept device creation to install PS hook.
+typedef HRESULT (WINAPI *PFN_D3D11CreateDevice)(
     IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT,
     const D3D_FEATURE_LEVEL*, UINT, UINT,
     ID3D11Device**, D3D_FEATURE_LEVEL*, ID3D11DeviceContext**);
-static PFN_CreateDevice g_origCreateDevice = nullptr;
+static PFN_D3D11CreateDevice g_origD3D11CreateDevice = nullptr;
+
+typedef HRESULT (WINAPI *PFN_D3D11CreateDASC)(
+    IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT,
+    const D3D_FEATURE_LEVEL*, UINT, UINT, const DXGI_SWAP_CHAIN_DESC*,
+    IDXGISwapChain**, ID3D11Device**, D3D_FEATURE_LEVEL*, ID3D11DeviceContext**);
+static PFN_D3D11CreateDASC g_origD3D11CreateDASC = nullptr;
+
+static bool g_psHooked = false;
+
+static void HookPSCreation(ID3D11Device* dev)
+{
+    if (g_psHooked || !dev) return;
+    g_psHooked = true;
+
+    void** vtable = *reinterpret_cast<void***>(dev);
+    MH_STATUS st = MH_CreateHook(vtable[15],
+                                  reinterpret_cast<void*>(HookCreatePixelShader),
+                                  reinterpret_cast<void**>(&g_origCPS));
+    if (st == MH_OK) {
+        MH_EnableHook(vtable[15]);
+        Log("MinHook: CreatePixelShader hooked OK");
+    } else {
+        Logf("MinHook: CreatePixelShader hook failed (%d)", st);
+    }
+}
 
 static HRESULT WINAPI HookD3D11CreateDevice(
     IDXGIAdapter* pA, D3D_DRIVER_TYPE dt, HMODULE sw, UINT fl,
     const D3D_FEATURE_LEVEL* pFL, UINT nFL, UINT sdk,
     ID3D11Device** ppDev, D3D_FEATURE_LEVEL* pFLOut, ID3D11DeviceContext** ppCtx)
 {
-    HRESULT hr = g_origCreateDevice(pA, dt, sw, fl, pFL, nFL, sdk,
-                                    ppDev, pFLOut, ppCtx);
-    if (SUCCEEDED(hr) && ppDev && *ppDev) HookDevice(*ppDev);
+    HRESULT hr = g_origD3D11CreateDevice(pA, dt, sw, fl, pFL, nFL, sdk,
+                                          ppDev, pFLOut, ppCtx);
+    if (SUCCEEDED(hr) && ppDev && *ppDev)
+        HookPSCreation(*ppDev);
     return hr;
 }
 
-// IAT hook — D3D11CreateDeviceAndSwapChain.
-typedef HRESULT (WINAPI *PFN_CreateDASC)(
-    IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT,
-    const D3D_FEATURE_LEVEL*, UINT, UINT, const DXGI_SWAP_CHAIN_DESC*,
-    IDXGISwapChain**, ID3D11Device**, D3D_FEATURE_LEVEL*, ID3D11DeviceContext**);
-static PFN_CreateDASC g_origCreateDASC = nullptr;
-
-static HRESULT WINAPI HookD3D11CreateDeviceAndSwapChain(
+static HRESULT WINAPI HookD3D11CreateDASC(
     IDXGIAdapter* pA, D3D_DRIVER_TYPE dt, HMODULE sw, UINT fl,
     const D3D_FEATURE_LEVEL* pFL, UINT nFL, UINT sdk,
     const DXGI_SWAP_CHAIN_DESC* pSD, IDXGISwapChain** ppSC,
     ID3D11Device** ppDev, D3D_FEATURE_LEVEL* pFLOut, ID3D11DeviceContext** ppCtx)
 {
-    HRESULT hr = g_origCreateDASC(pA, dt, sw, fl, pFL, nFL, sdk, pSD, ppSC,
-                                  ppDev, pFLOut, ppCtx);
-    if (SUCCEEDED(hr) && ppDev && *ppDev) HookDevice(*ppDev);
+    HRESULT hr = g_origD3D11CreateDASC(pA, dt, sw, fl, pFL, nFL, sdk, pSD, ppSC,
+                                        ppDev, pFLOut, ppCtx);
+    if (SUCCEEDED(hr) && ppDev && *ppDev)
+        HookPSCreation(*ppDev);
     return hr;
 }
 
-static void PatchIAT()
+static void InstallD3D11Hooks()
 {
-    auto* base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
-    auto* dos  = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-    auto* nt   = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-    auto& dir  = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
+    // Load D3DCompile from d3dcompiler_47.dll for shader compilation.
+    HMODULE hCompiler = LoadLibraryW(L"d3dcompiler_47.dll");
+    if (hCompiler) {
+        g_pD3DCompile = reinterpret_cast<PFN_D3DCompile>(
+            GetProcAddress(hCompiler, "D3DCompile"));
+        if (g_pD3DCompile)
+            Log("D3DCompile: loaded from d3dcompiler_47.dll");
+        else
+            Log("D3DCompile: GetProcAddress failed");
+    } else {
+        Log("D3DCompile: d3dcompiler_47.dll not found");
+    }
 
-    for (; desc->Name; ++desc) {
-        if (_stricmp(reinterpret_cast<const char*>(base + desc->Name), "d3d11.dll") != 0)
-            continue;
-        auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + desc->FirstThunk);
-        auto* orig  = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + desc->OriginalFirstThunk);
-        for (; thunk->u1.Function; ++thunk, ++orig) {
-            if (orig->u1.Ordinal & IMAGE_ORDINAL_FLAG64) continue;
-            auto* ibn = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
-                base + orig->u1.AddressOfData);
-            DWORD old;
-            if (strcmp(ibn->Name, "D3D11CreateDevice") == 0) {
-                VirtualProtect(&thunk->u1.Function, 8, PAGE_EXECUTE_READWRITE, &old);
-                g_origCreateDevice = reinterpret_cast<PFN_CreateDevice>(thunk->u1.Function);
-                thunk->u1.Function = reinterpret_cast<ULONGLONG>(HookD3D11CreateDevice);
-                VirtualProtect(&thunk->u1.Function, 8, old, &old);
-                Log("IAT: D3D11CreateDevice hooked");
-            } else if (strcmp(ibn->Name, "D3D11CreateDeviceAndSwapChain") == 0) {
-                VirtualProtect(&thunk->u1.Function, 8, PAGE_EXECUTE_READWRITE, &old);
-                g_origCreateDASC   = reinterpret_cast<PFN_CreateDASC>(thunk->u1.Function);
-                thunk->u1.Function = reinterpret_cast<ULONGLONG>(HookD3D11CreateDeviceAndSwapChain);
-                VirtualProtect(&thunk->u1.Function, 8, old, &old);
-                Log("IAT: D3D11CreateDeviceAndSwapChain hooked");
-            }
-        }
-        break;
+    // Compile HUD replacement shader.
+    CompileHudShader();
+
+    MH_STATUS st;
+
+    st = MH_CreateHookApi(L"d3d11.dll", "D3D11CreateDevice",
+                           reinterpret_cast<void*>(HookD3D11CreateDevice),
+                           reinterpret_cast<void**>(&g_origD3D11CreateDevice));
+    if (st == MH_OK) {
+        MH_EnableHook(reinterpret_cast<void*>(
+            GetProcAddress(GetModuleHandleW(L"d3d11.dll"), "D3D11CreateDevice")));
+        Log("MinHook: D3D11CreateDevice hooked");
+    } else {
+        Logf("MinHook: D3D11CreateDevice hook failed (%d)", st);
+    }
+
+    st = MH_CreateHookApi(L"d3d11.dll", "D3D11CreateDeviceAndSwapChain",
+                           reinterpret_cast<void*>(HookD3D11CreateDASC),
+                           reinterpret_cast<void**>(&g_origD3D11CreateDASC));
+    if (st == MH_OK) {
+        MH_EnableHook(reinterpret_cast<void*>(
+            GetProcAddress(GetModuleHandleW(L"d3d11.dll"), "D3D11CreateDeviceAndSwapChain")));
+        Log("MinHook: D3D11CreateDeviceAndSwapChain hooked");
+    } else {
+        Logf("MinHook: D3D11CreateDeviceAndSwapChain hook failed (%d)", st);
     }
 }
 
@@ -521,24 +580,34 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
         g_log.open(logPath, std::ios::out | std::ios::trunc);
         Log("ac7ultrawide ASI loaded");
 
-        // Compute clip-space shift for HUD text VS hook.
-        // Done here (not in the patch thread) so g_clip_shift is ready before
-        // the game calls D3D11CreateDevice.
+        // Compute HUD shift for shader correction.
         {
             SetProcessDPIAware();
             const int w = GetSystemMetrics(SM_CXSCREEN);
             const int h = GetSystemMetrics(SM_CYSCREEN);
+            const double aspect = (h > 0) ? (double)w / h : 0.0;
             constexpr double kStd = 16.0 / 9.0;
-            if (h > 0) {
-                const double aspect = static_cast<double>(w) / h;
-                if (aspect > kStd + 0.01)
-                    g_clip_shift = 1.0 - kStd / aspect;
+            if (aspect > kStd + 0.01) {
+                const double stdW = w * (1080.0 / h);
+                g_hudShift = (float)(-((stdW - 1920.0) / 3840.0));
+                Logf("HUD shader: aspect=%.4f shift=%.6f", aspect, g_hudShift);
             }
-            Logf("Shader hook: clip_shift=%.6f", g_clip_shift);
         }
-        PatchIAT();
+
+        // Initialize MinHook and install D3D11 function hooks.
+        if (MH_Initialize() == MH_OK) {
+            InstallD3D11Hooks();
+            Log("MinHook initialized");
+        } else {
+            Log("MinHook: MH_Initialize failed");
+        }
 
         CloseHandle(CreateThread(nullptr, 0, PatchThread, nullptr, 0, nullptr));
+    }
+    else if (reason == DLL_PROCESS_DETACH)
+    {
+        MH_DisableHook(MH_ALL_HOOKS);
+        MH_Uninitialize();
     }
     return TRUE;
 }
